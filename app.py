@@ -7,6 +7,7 @@ import threading
 import time
 import json
 import shutil
+import ipaddress
 
 # Get the absolute path to the application directory
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -135,6 +136,25 @@ else:
 cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
+def is_same_network(ip1, ip2, subnet_mask='255.255.255.0'):
+    """
+    Check if two IP addresses are in the same network subnet
+    
+    Args:
+        ip1 (str): First IP address
+        ip2 (str): Second IP address
+        subnet_mask (str, optional): Subnet mask. Defaults to '255.255.255.0'
+    
+    Returns:
+        bool: True if IPs are in the same network, False otherwise
+    """
+    try:
+        network1 = ipaddress.IPv4Network(f"{ip1}/{subnet_mask}", strict=False)
+        network2 = ipaddress.IPv4Network(f"{ip2}/{subnet_mask}", strict=False)
+        return network1 == network2
+    except Exception:
+        return False
+
 @app.route('/')
 def index():
     # Get initial file list
@@ -168,6 +188,8 @@ def upload_file():
     uploaded_files = []
     files_db = load_files_db()
     
+    client_ip = request.remote_addr
+    
     for file in files:
         if file.filename == '':
             continue
@@ -195,7 +217,16 @@ def upload_file():
     
     if uploaded_files:
         save_files_db(files_db)
-        socketio.emit('new_files', {'files': uploaded_files})
+        
+        # Only notify clients in the same network about new files
+        for sid, socket_info in socketio.server.eio.sockets.items():
+            try:
+                socket_ip = socket_info.environ.get('REMOTE_ADDR')
+                if is_same_network(client_ip, socket_ip):
+                    socketio.emit('new_files', {'files': uploaded_files}, room=sid)
+            except Exception:
+                pass
+        
         return jsonify({'message': 'Files uploaded successfully', 'files': uploaded_files})
     
     return jsonify({'error': 'No valid files uploaded'}), 400
@@ -230,6 +261,8 @@ def download_file(filename):
 @app.route('/delete/<filename>', methods=['DELETE'])
 def delete_file(filename):
     try:
+        client_ip = request.remote_addr
+        
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         if os.path.exists(filepath):
             os.remove(filepath)
@@ -238,7 +271,15 @@ def delete_file(filename):
         files_db = [f for f in files_db if f['filename'] != filename]
         save_files_db(files_db)
         
-        socketio.emit('file_removed', {'filename': filename})
+        # Only notify clients in the same network about file deletion
+        for sid, socket_info in socketio.server.eio.sockets.items():
+            try:
+                socket_ip = socket_info.environ.get('REMOTE_ADDR')
+                if is_same_network(client_ip, socket_ip):
+                    socketio.emit('file_removed', {'filename': filename}, room=sid)
+            except Exception:
+                pass
+        
         return jsonify({'message': 'File deleted successfully'})
     except Exception as e:
         return jsonify({'error': f'Failed to delete file: {str(e)}'}), 400
@@ -249,23 +290,46 @@ def delete_message(message_id):
         messages = load_messages()
         messages = [m for m in messages if m['id'] != message_id]
         save_messages(messages)
-        socketio.emit('message_deleted', {'id': message_id})
+        
+        # Only notify clients in the same network about message deletion
+        for sid, socket_info in socketio.server.eio.sockets.items():
+            try:
+                socket_ip = socket_info.environ.get('REMOTE_ADDR')
+                client_ip = request.remote_addr
+                if is_same_network(client_ip, socket_ip):
+                    socketio.emit('message_deleted', {'id': message_id}, room=sid)
+            except Exception:
+                pass
+        
         return jsonify({'message': 'Message deleted successfully'})
     except Exception as e:
         return jsonify({'error': f'Failed to delete message: {str(e)}'}), 400
 
 @socketio.on('send_message')
 def handle_message(data):
+    # Get client IP address
+    client_ip = request.remote_addr
+    
     message = {
         'id': f"msg_{int(time.time() * 1000)}",
         'message': data['message'],
         'plainText': data.get('plainText', ''),  # Store plain text version
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now().isoformat(),
+        'client_ip': client_ip  # Store client IP with message
     }
+    
     messages = load_messages()
     messages.append(message)
     save_messages(messages)
-    emit('new_message', message, broadcast=True)
+    
+    # Only emit to clients in the same network
+    for sid, socket_info in socketio.server.eio.sockets.items():
+        try:
+            socket_ip = socket_info.environ.get('REMOTE_ADDR')
+            if is_same_network(client_ip, socket_ip):
+                socketio.emit('new_message', message, room=sid)
+        except Exception:
+            pass
 
 @app.route('/messages')
 def get_messages():
